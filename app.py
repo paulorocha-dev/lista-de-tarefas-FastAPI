@@ -1,8 +1,18 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import secrets
+
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, asc, desc
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+
+DATABASE_URL = "sqlite:///./tarefas.db"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
 app = FastAPI(
     title="API de Tarefas",
@@ -19,12 +29,27 @@ minha_senha = "admin123"
 
 security = HTTPBasic()
 
-minhas_tarefas: List['Tarefa'] = []
+class TarefaDB(Base):
+    __tablename__ = "Tarefas"
+
+    id = Column(Integer, primary_key=True, index=True)
+    nome_tarefa = Column(String, unique=True, index=True)
+    descricao_tarefa = Column(String)
+    tarefa_concluida = Column(Boolean, default=False, index=True)
 
 class Tarefa(BaseModel):
     nome_tarefa: str
     descricao_tarefa: str
     tarefa_concluida: bool = False
+
+Base.metadata.create_all(bind=engine)
+
+def sessao_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 def autenticar_usuario(credentials: HTTPBasicCredentials = Depends(security)):
     is_username_correct = secrets.compare_digest(credentials.username, meu_usuario)
@@ -39,55 +64,76 @@ def autenticar_usuario(credentials: HTTPBasicCredentials = Depends(security)):
 
 @app.get("/tarefas")
 def get_tarefas(
-    page: int = 1, 
+    page: int = 1,
     limit: int = 10,
+    ordenar_por: Optional[str] = Query("nome_tarefa", regex="^(id|nome_tarefa|descricao_tarefa|tarefa_concluida)$"),
+    direcao: Optional[str] = Query("asc", regex="^(asc|desc)$"),
+    db: Session = Depends(sessao_db),
     credentials: HTTPBasicCredentials = Depends(autenticar_usuario)
 ):
     if page < 1 or limit < 1:
         raise HTTPException(status_code=400, detail="Parâmetros inválidos. 'page' e 'limit' devem ser maiores que 0.")
 
-    if not minhas_tarefas:
-        return {"message": "Nenhuma tarefa cadastrada."}
-    
-    # Ordenação fixa pelo nome da tarefa
-    tarefas_ordenadas = sorted(minhas_tarefas, key=lambda x: x.nome_tarefa)
+    order_func = asc if direcao == "asc" else desc
+    tarefas = db.query(TarefaDB)\
+                .order_by(order_func(getattr(TarefaDB, ordenar_por)))\
+                .offset((page - 1) * limit)\
+                .limit(limit)\
+                .all()
 
-    start = (page - 1) * limit
-    end = start + limit
-
-    tarefas_paginadas = [
-        {"nome_tarefa": tarefa_data.nome_tarefa, "descricao_tarefa": tarefa_data.descricao_tarefa, "tarefa_concluida": tarefa_data.tarefa_concluida}
-        for tarefa_data in tarefas_ordenadas[start:end]
-    ]
+    total_tarefas = db.query(TarefaDB).count()
 
     return {
         "page": page,
         "limit": limit,
-        "total_tarefas": len(minhas_tarefas),
-        "tarefas": tarefas_paginadas
+        "total_tarefas": total_tarefas,
+        "tarefas": [{
+            "id": tarefa.id,
+            "nome_tarefa": tarefa.nome_tarefa,
+            "descricao_tarefa": tarefa.descricao_tarefa,
+            "tarefa_concluida": tarefa.tarefa_concluida
+        } for tarefa in tarefas]
     }
 
 @app.post("/adiciona")
-def post_tarefas(tarefa: Tarefa, credentials: HTTPBasicCredentials = Depends(autenticar_usuario)):
-    for minha_tarefa in minhas_tarefas:
-        if minha_tarefa.nome_tarefa == tarefa.nome_tarefa:
-            raise HTTPException(status_code=400, detail="Tarefa já cadastrada.")
-    minhas_tarefas.append(tarefa)
-    return {"message": "Tarefa adicionada com sucesso."}
+def post_tarefas(tarefa: Tarefa, db: Session = Depends(sessao_db), credentials: HTTPBasicCredentials = Depends(autenticar_usuario)):
+    db_tarefa = db.query(TarefaDB).filter(TarefaDB.nome_tarefa == tarefa.nome_tarefa).first()
+    if db_tarefa:
+        raise HTTPException(status_code=400, detail="Tarefa com esse nome já existe.")
+    
+    nova_tarefa = TarefaDB(
+        nome_tarefa=tarefa.nome_tarefa,
+        descricao_tarefa=tarefa.descricao_tarefa,
+        tarefa_concluida=tarefa.tarefa_concluida
+    )
+    db.add(nova_tarefa)
+    db.commit()
+    db.refresh(nova_tarefa)
 
+    return {"message": "Tarefa adicionada com sucesso."}
+    
 @app.put("/atualiza/{nome_tarefa}")
-def put_tarefas(nome_tarefa: str, tarefa: Tarefa, credentials: HTTPBasicCredentials = Depends(autenticar_usuario)):
-    for minha_tarefa in minhas_tarefas:
-        if minha_tarefa.nome_tarefa == nome_tarefa:
-            minha_tarefa.descricao_tarefa = tarefa.descricao_tarefa
-            minha_tarefa.tarefa_concluida = tarefa.tarefa_concluida
-            return {"message": "Tarefa atualizada com sucesso."}
-    raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
+def put_tarefas(nome_tarefa: str, tarefa: Tarefa, db: Session = Depends(sessao_db), credentials: HTTPBasicCredentials = Depends(autenticar_usuario)):
+    db_tarefa = db.query(TarefaDB).filter(TarefaDB.nome_tarefa == nome_tarefa).first()
+    if not db_tarefa:
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
+    
+    db_tarefa.nome_tarefa = tarefa.nome_tarefa
+    db_tarefa.descricao_tarefa = tarefa.descricao_tarefa
+    db_tarefa.tarefa_concluida = tarefa.tarefa_concluida
+
+    db.commit()
+    db.refresh(db_tarefa)
+
+    return {"message": "Tarefa atualizada com sucesso."}
 
 @app.delete("/deletar/{nome_tarefa}")
-def delete_tarefas(nome_tarefa: str, credentials: HTTPBasicCredentials = Depends(autenticar_usuario)):
-    for minha_tarefa in minhas_tarefas:
-        if minha_tarefa.nome_tarefa == nome_tarefa:
-            minhas_tarefas.remove(minha_tarefa)
-            return {"message": "Tarefa deletada com sucesso."}
-    raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
+def delete_tarefas(nome_tarefa: str, db: Session = Depends(sessao_db), credentials: HTTPBasicCredentials = Depends(autenticar_usuario)):
+    db_tarefa = db.query(TarefaDB).filter(TarefaDB.nome_tarefa == nome_tarefa).first()
+    if not db_tarefa:
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
+    
+    db.delete(db_tarefa)
+    db.commit()
+
+    return {"message": "Tarefa deletada com sucesso."}
